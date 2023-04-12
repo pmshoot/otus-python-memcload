@@ -13,7 +13,7 @@ from optparse import OptionParser
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
 # pip install protobuf
-from memc_load import appsinstalled_pb2
+from memc_load import appsinstalled_pb2, utils
 # pip install python-memcached
 from memcache import Client
 
@@ -72,21 +72,21 @@ class Worker(threading.Thread):
                     # wrong str task
                     continue
             else:
-                dev_type, key, packed = task
+                dev_type, data_map = task
                 memc = self.device_memc.get(dev_type)
                 if not memc:
                     self.errors += 1
                     logging.error("%s: Unknown device type: %s" % (self.name, dev_type))
                     self.task_queue.task_done()
                     continue
-                ok = self.insert_appsinstalled(memc, key, packed, self.dry_run)
+                ok = self.insert_appsinstalled(memc, data_map, self.dry_run)
                 if ok:
-                    self.processed += 1
+                    self.processed += len(data_map)
                 else:
-                    self.errors += 1
+                    self.errors += len(data_map)
                 self.task_queue.task_done()
 
-    def insert_appsinstalled(self, memc: Client, key, packed, dry_run=False):
+    def insert_appsinstalled(self, memc: Client, data_map, dry_run=False):
         # ua = appsinstalled_pb2.UserApps()
         # ua.lat = task.lat
         # ua.lon = task.lon
@@ -96,9 +96,9 @@ class Worker(threading.Thread):
         try:
             if dry_run:
                 # logging.debug("%s: %s - %s -> %s" % (self.name, memc.servers, key, str(ua).replace("\n", " ")))
-                logging.debug("%s: %s - %s -> %s" % (self.name, memc.servers, key, packed))
+                logging.debug("%s: %s --> %s" % (self.name, memc.servers, data_map))
             else:
-                memc.set(key, packed)
+                memc.set_multi(data_map)
         except Exception as e:
             logging.exception("%s: Cannot write to memc %s: %s" % (self.name, memc.servers, e))
             return False
@@ -152,6 +152,8 @@ def get_task_data(appsinstalled: AppsInstalled) -> tuple:
 
 
 def main(options, workers_list):
+    device_memc = ("idfa", "gaid", "adid", "dvid")
+    preprocessed = utils.Accumulator(buf_size=options.buffer)
     for fn in glob.iglob(options.pattern):
         processed = errors = 0
         logging.info('Processing %s' % fn)
@@ -165,8 +167,24 @@ def main(options, workers_list):
             if not appsinstalled:
                 errors += 1
                 continue
-            # заполняем очередь для тредов-труженников
-            task_queue.put(get_task_data(appsinstalled))
+            if appsinstalled.dev_type not in device_memc:
+                errors += 1
+                logging.error("Unknown device type: %s" % appsinstalled.dev_type)
+                continue
+
+            dev_type, key, packed = get_task_data(appsinstalled)
+            preprocessed.put(dev_type, key, packed)
+            dev_type, data_map = preprocessed.pop_ready()
+            if dev_type:
+                # заполняем очередь для тредов-труженников
+                task_queue.put((dev_type, data_map))
+
+        # drain accumulator
+        while not preprocessed.is_empty():
+            dev_type, data_map = preprocessed.pop_ready(drain=True)
+            if dev_type:
+                task_queue.put((dev_type, data_map))
+
         # сигнал для подготовки результатов работы воркеров
         for _ in range(len(workers_list)):
             task_queue.put('result')
@@ -181,7 +199,6 @@ def main(options, workers_list):
         if not processed:
             fd.close()
             if not options.dry:
-                """"""
                 dot_rename(fn)
             event.set()  # сигнал для продолжения работы воркеров
             continue
@@ -193,7 +210,6 @@ def main(options, workers_list):
             logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
         fd.close()
         if not options.dry:
-            """"""
             dot_rename(fn)
         event.set()
 
@@ -226,6 +242,7 @@ if __name__ == '__main__':
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("-w", "--workers", type=int, action="store", default=2)
+    op.add_option("-b", "--buffer", action="store", type=int, default=5)
     op.add_option("--dry", action="store_true", default=False)
     op.add_option("--pattern", action="store", default="data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")

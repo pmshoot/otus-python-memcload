@@ -19,6 +19,7 @@ from memcache import Client
 # protoc  --python_out=. ./appsinstalled.proto
 # pip install protobuf
 from memc_load import appsinstalled_pb2
+from utils import Accumulator
 
 NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
@@ -39,11 +40,16 @@ class ProcessWorker(mp.Process):
     def run(self) -> None:
         """"""
         errors = 0
-
+        preprocessed = Accumulator(buf_size=self.opts.buffer)
         while True:
             line = self.task_queue.get()
             if line == 'result':
-                """"""
+                # drain accumulator
+                while not preprocessed.is_empty():
+                    dev_type, data_map = preprocessed.pop_ready(drain=True)
+                    if dev_type:
+                        self.worker_task_queue.put((dev_type, data_map))
+
                 result_total = {
                     'errors': 0,
                     'processed': 0,
@@ -65,6 +71,7 @@ class ProcessWorker(mp.Process):
                 self.task_result_queue.put(result_total)
                 logging.debug(f'Process {self.name}: Результаты выгружены: {result_total}')
                 self.task_queue.task_done()
+                logging.debug(f'Process {self.name}: ожидание сигнала продолжения')
                 self.event.wait()
                 self.worker_event.set()
                 errors = 0
@@ -86,10 +93,14 @@ class ProcessWorker(mp.Process):
                     key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
                     ua.apps.extend(appsinstalled.apps)
                     packed = ua.SerializeToString()
-                    # в тред
-                    self.worker_task_queue.put((appsinstalled.dev_type, key, packed))
+
+                    preprocessed.put(appsinstalled.dev_type, key, packed)
+                    _, data_map = preprocessed.pop_ready()
+                    if data_map:
+                        # в тред
+                        self.worker_task_queue.put((appsinstalled.dev_type, data_map))
                 else:
-                    errors += 1
+                    errors += self.opts.buffer
                 self.task_queue.task_done()
                 if self.worker_event.is_set():
                     self.worker_event.clear()
@@ -161,6 +172,7 @@ class ThreadWorker(threading.Thread):
                     self.worker_task_queue.task_done()
                     logging.debug(f'{self.name}: Результаты выгружены: {res}')
                     self.errors = self.processed = 0
+                    logging.debug(f'{self.name}: ожидание сигнала продолжения')
                     self.event.wait()  # ждем чтения следующего файла
                     continue
                 elif task == 'quit':
@@ -168,20 +180,20 @@ class ThreadWorker(threading.Thread):
                     logging.debug(f'{self.name}: Выход')
                     break
             else:
-                dev_type, key, packed = task
+                dev_type, data_map = task
                 memc = self.device_memc.get(dev_type)
                 if not memc:
                     self.errors += 1
                     logging.error("%s: Unknown device type: %s" % (self.name, task.dev_type))
                     continue
-                ok = self.insert_appsinstalled(memc, key, packed, self.dry_run)
+                ok = self.insert_appsinstalled(memc, data_map, self.dry_run)
                 if ok:
-                    self.processed += 1
+                    self.processed += len(data_map)
                 else:
-                    self.errors += 1
+                    self.errors += len(data_map)
                 self.worker_task_queue.task_done()
 
-    def insert_appsinstalled(self, memc, key, packed, dry_run=False):
+    def insert_appsinstalled(self, memc, data_map, dry_run=False):
         # ua = appsinstalled_pb2.UserApps()
         # ua.lat = task.lat
         # ua.lon = task.lon
@@ -190,9 +202,9 @@ class ThreadWorker(threading.Thread):
         # packed = ua.SerializeToString()
         try:
             if dry_run:
-                logging.debug("%s: %s - %s -> %s" % (self.name, memc.servers, key, packed))
+                logging.debug("%s: %s --> %s" % (self.name, memc.servers, data_map))
             else:
-                memc.set(key, packed)
+                memc.set_multi(data_map)
         except Exception as e:
             logging.exception("%s: Cannot write to memc %s: %s" % (self.name, memc.servers, e))
             return False
@@ -227,6 +239,7 @@ def main(options):
             if not line:
                 continue
             task_queue.put(line)
+
         for _ in range(len(proc_list)):
             task_queue.put('result')
         task_queue.join()
@@ -241,7 +254,6 @@ def main(options):
         if not processed:
             fd.close()
             if not options.dry:
-                """"""
                 dot_rename(fn)
             event.set()
             continue
@@ -253,7 +265,6 @@ def main(options):
             logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
         fd.close()
         if not options.dry:
-            """"""
             dot_rename(fn)
         event.set()
 
@@ -288,6 +299,7 @@ if __name__ == '__main__':
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("-w", "--workers", type=int, action="store", default=4)
     op.add_option("-p", "--processes", type=int, action="store", default=ncpu)
+    op.add_option("-b", "--buffer", action="store", type=int, default=5)
     op.add_option("--dry", action="store_true", default=False)
     op.add_option("--pattern", action="store", default="data/appsinstalled/*.tsv.gz")
     # op.add_option("--idfa", action="store", default="127.0.0.1:33013")
